@@ -46,12 +46,12 @@ FridgeGuard turns an ordinary refrigerator into a connected device: door monitor
 
 ## Hardware
 
-| Component | Spec | Approx. Cost |
-|---|---|---|
-| ESP32-C3 SuperMini | Built-in 0.42" 72×40 OLED | $4–6 |
-| DS18B20 | Waterproof probe | $2–3 |
-| Magnetic Reed Switch | Normally Open (NO) | $0.50–1 |
-| 4.7kΩ Resistor | Pull-up for DS18B20 | $0.05 |
+| Component | Spec | 
+|---|---|
+| ESP32-C3 SuperMini | Built-in 0.42" 72×40 OLED |
+| DS18B20 | Waterproof probe |
+| Magnetic Reed Switch | Normally Open (NO) |
+| 4.7kΩ Resistor | Pull-up for DS18B20 |
 
 **Pin Reference**
 
