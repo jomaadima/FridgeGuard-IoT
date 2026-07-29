@@ -52,12 +52,12 @@
 //
 //  Door alert behavior:
 //    - Alert #1 after door is open for 60 seconds
-//    - Then repeats every 5 minutes while it stays open
+//    - Then repeats every 2 minutes while it stays open
 //    - Paused entirely while Maintenance Mode is active
 //
 //  Temperature alert behavior:
-//    - Temp alert when temp > 30C
-//    - Repeats every 10 minutes while temp stays > 30C (was 5 min)
+//    - Temp alert when temp > 8C
+//    - Repeats every 5 minutes while temp stays above the threshold
 //    - 1C hysteresis before re-arming
 //    - Paused entirely while Maintenance Mode is active
 // ============================================================
@@ -84,6 +84,11 @@ String deviceId;
 
 // Firestore REST API endpoint — built in setup() once deviceId is known
 String firestoreURL;
+
+// Public Telegram bot username resolved safely from BOT_TOKEN using getMe.
+// The secret token never leaves the ESP32. Only the public @username is
+// uploaded to Firestore so the website can open the correct bot per Device ID.
+String telegramBotUsername = "";
 
 // ---------- Pin Definitions ----------
 #define LED_PIN    8   // Onboard LED heartbeat
@@ -144,6 +149,11 @@ volatile unsigned long lastButtonEdgeTime = 0;
 int totalOpenings = 0;
 unsigned long totalOpenSeconds = 0;
 unsigned long longestOpening = 0;
+unsigned long lastOpeningDuration = 0; // duration of the MOST RECENT single opening, not today's longest
+
+// ---------- Sensor Health ----------
+bool sensorTempOk = false; // true when the DS18B20 last returned a valid (non -127) reading
+bool sensorDoorOk = true;  // no software self-test exists for a passive reed switch — always true
 
 // Running temperature average (accumulated each temp reading, divided at midnight)
 float tempSum = 0.0;
@@ -200,7 +210,9 @@ unsigned long maintenanceDurationMs = 0;
 
 // ---------- Telegram Polling ----------
 unsigned long lastTelegramPoll = 0;
-#define TELEGRAM_POLL_INTERVAL_MS 3000UL
+#define TELEGRAM_POLL_INTERVAL_MS 8000UL   // was 3s — each poll blocks loop() for
+                                            // 1-2s; 8s interval keeps the screen
+                                            // smooth while still catching commands fast
 
 long telegramUpdateOffset = 0;
 
@@ -221,7 +233,9 @@ bool wifiWasConnected = false;
 unsigned long wifiLostAt = 0;
 
 unsigned long lastScreenRefresh = 0;
-#define SCREEN_REFRESH_INTERVAL_MS 200UL
+#define SCREEN_REFRESH_INTERVAL_MS 500UL   // was 200ms — no need to redraw 5x/sec
+                                            // HTTP calls block loop() for 1-3s each;
+                                            // 500ms refresh avoids fighting with them
 
 unsigned long lastHeartbeat = 0;
 #define HEARTBEAT_INTERVAL_MS 1000UL
@@ -328,7 +342,77 @@ void prepareWiFiLowPower() {
   WiFi.setSleep(false);
 
   // IMPORTANT FIX FOR YOUR ESP32-C3 (see note above)
-  WiFi.setTxPower(WIFI_POWER_13dBm);
+  WiFi.setTxPower(WIFI_POWER_17dBm);
+}
+
+void scanAndPrintNetworks() {
+  Serial.println();
+  Serial.println("=== Scanning for WiFi networks ===");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(200);
+
+  int n = WiFi.scanNetworks();
+
+  if (n == 0) {
+    Serial.println("No networks found at all — check antenna/board.");
+    return;
+  }
+
+  Serial.print(n);
+  Serial.println(" networks found:");
+  Serial.println("SSID                          | RSSI | Ch | Encryption");
+  Serial.println("---------------------------------------------------------");
+
+  bool foundTarget = false;
+
+  for (int i = 0; i < n; i++) {
+    String ssid = WiFi.SSID(i);
+    int rssi = WiFi.RSSI(i);
+    int channel = WiFi.channel(i);
+    wifi_auth_mode_t enc = WiFi.encryptionType(i);
+
+    String encStr;
+    switch (enc) {
+      case WIFI_AUTH_OPEN:            encStr = "OPEN"; break;
+      case WIFI_AUTH_WEP:             encStr = "WEP"; break;
+      case WIFI_AUTH_WPA_PSK:         encStr = "WPA"; break;
+      case WIFI_AUTH_WPA2_PSK:        encStr = "WPA2"; break;
+      case WIFI_AUTH_WPA_WPA2_PSK:    encStr = "WPA/WPA2 mixed"; break;
+      case WIFI_AUTH_WPA2_ENTERPRISE: encStr = "WPA2-Enterprise"; break;
+      case WIFI_AUTH_WPA3_PSK:        encStr = "WPA3"; break;
+      case WIFI_AUTH_WPA2_WPA3_PSK:   encStr = "WPA2/WPA3 mixed"; break;
+      default:                        encStr = "Unknown"; break;
+    }
+
+    Serial.printf("%-30s | %4d | %2d | %s\n",
+                  ssid.c_str(), rssi, channel, encStr.c_str());
+
+    if (ssid == String(WIFI_SSID)) {
+      foundTarget = true;
+      Serial.println("  ^^^ THIS IS YOUR TARGET NETWORK ^^^");
+      if (enc == WIFI_AUTH_WPA3_PSK || enc == WIFI_AUTH_WPA2_WPA3_PSK) {
+        Serial.println("  WARNING: WPA3/mixed mode — ESP32-C3 often fails here.");
+        Serial.println("  Fix: set hotspot security to WPA2-only.");
+      }
+      if (channel > 11) {
+        Serial.println("  WARNING: channel >11 — likely 5GHz. ESP32-C3 is 2.4GHz only.");
+      }
+    }
+  }
+
+  if (!foundTarget) {
+    Serial.println();
+    Serial.println("Your target SSID was NOT seen in the scan at all.");
+    Serial.println("Most likely cause: hotspot is broadcasting on 5GHz only,");
+    Serial.println("or SSID is hidden. Force the hotspot to 2.4GHz / WPA2.");
+  }
+
+  Serial.println("===================================");
+  Serial.println();
+
+  WiFi.scanDelete();
 }
 
 void connectWiFi() {
@@ -437,17 +521,52 @@ String urlEncode(String str) {
 }
 
 String jsonExtractString(String src, String key, int startIndex = 0) {
-  String pattern = "\"" + key + "\":\"";
-  int start = src.indexOf(pattern, startIndex);
+  // Works with both compact JSON:
+  //   "stringValue":"START_20"
+  // and Firestore's spaced JSON:
+  //   "stringValue": "START_20"
+  String keyPattern = "\"" + key + "\"";
+  int keyStart = src.indexOf(keyPattern, startIndex);
+  if (keyStart < 0) return "";
 
-  if (start < 0) return "";
+  int colon = src.indexOf(':', keyStart + keyPattern.length());
+  if (colon < 0) return "";
 
-  start += pattern.length();
-  int end = src.indexOf("\"", start);
+  int valueStart = colon + 1;
+  while (valueStart < src.length()) {
+    char c = src.charAt(valueStart);
+    if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+      valueStart++;
+    } else {
+      break;
+    }
+  }
 
-  if (end < 0) return "";
+  if (valueStart >= src.length() || src.charAt(valueStart) != '\"') return "";
+  valueStart++;
 
-  return src.substring(start, end);
+  String result = "";
+  bool escaped = false;
+
+  for (int i = valueStart; i < src.length(); i++) {
+    char c = src.charAt(i);
+
+    if (escaped) {
+      result += c;
+      escaped = false;
+      continue;
+    }
+
+    if (c == '\\') {
+      escaped = true;
+      continue;
+    }
+
+    if (c == '\"') return result;
+    result += c;
+  }
+
+  return "";
 }
 
 long jsonExtractLong(String src, String key, int startIndex = 0) {
@@ -466,6 +585,58 @@ long jsonExtractLong(String src, String key, int startIndex = 0) {
   if (end == start) return -1;
 
   return src.substring(start, end).toInt();
+}
+
+// Resolve the public Telegram bot username that belongs to BOT_TOKEN.
+// This uses Telegram's getMe endpoint. The token stays only on the ESP32;
+// Firestore receives only the safe public username, such as MyFridgeBot.
+bool refreshTelegramBotUsername() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Cannot resolve Telegram bot username — WiFi not connected");
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setTimeout(5000);
+
+  String url = "https://api.telegram.org/bot";
+  url += BOT_TOKEN;
+  url += "/getMe";
+
+  http.begin(client, url);
+  int httpCode = http.GET();
+
+  if (httpCode != 200) {
+    Serial.print("Telegram getMe failed, code: ");
+    Serial.println(httpCode);
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  int resultPosition = payload.indexOf("\"result\"");
+  String username = jsonExtractString(
+      payload,
+      "username",
+      resultPosition >= 0 ? resultPosition : 0
+  );
+  username.trim();
+
+  if (username.length() == 0) {
+    Serial.println("Telegram getMe succeeded but no bot username was found.");
+    return false;
+  }
+
+  telegramBotUsername = username;
+
+  Serial.print("Telegram bot linked to this Device ID: @");
+  Serial.println(telegramBotUsername);
+  return true;
 }
 
 void updateLastAlertTime();
@@ -576,8 +747,34 @@ void sendToFirestore() {
     return;
   }
 
+  // Use an update mask so this regular status upload never deletes or
+  // overwrites maintenanceCommand while the website is waiting for the ESP32.
+  String statusURL = firestoreURL;
+  statusURL += "&updateMask.fieldPaths=doorStatus";
+  statusURL += "&updateMask.fieldPaths=temperature";
+  statusURL += "&updateMask.fieldPaths=wifiSignal";
+  statusURL += "&updateMask.fieldPaths=wifiSSID";
+  statusURL += "&updateMask.fieldPaths=sensorTempOk";
+  statusURL += "&updateMask.fieldPaths=sensorDoorOk";
+  statusURL += "&updateMask.fieldPaths=lastOpeningDuration";
+  statusURL += "&updateMask.fieldPaths=totalOpenings";
+  statusURL += "&updateMask.fieldPaths=totalOpenSeconds";
+  statusURL += "&updateMask.fieldPaths=longestOpening";
+  statusURL += "&updateMask.fieldPaths=lastAlertMessage";
+  statusURL += "&updateMask.fieldPaths=lastTempDelta";
+  statusURL += "&updateMask.fieldPaths=maintenanceActive";
+  statusURL += "&updateMask.fieldPaths=maintenanceSecondsLeft";
+  statusURL += "&updateMask.fieldPaths=lastSeenEpoch";
+  statusURL += "&updateMask.fieldPaths=uptimeSeconds";
+  statusURL += "&updateMask.fieldPaths=lastUpdated";
+  statusURL += "&updateMask.fieldPaths=lastOpenedTime";
+  statusURL += "&updateMask.fieldPaths=lastAlertTime";
+  statusURL += "&updateMask.fieldPaths=temperatureThreshold";
+  statusURL += "&updateMask.fieldPaths=telegramBotUsername";
+  statusURL += "&updateMask.fieldPaths=deviceId";
+
   HTTPClient http;
-  http.begin(firestoreURL);
+  http.begin(statusURL);
   http.addHeader("Content-Type", "application/json");
 
   // Firestore's REST API requires this specific nested "fields" format.
@@ -586,6 +783,10 @@ void sendToFirestore() {
   json += "\"doorStatus\": {\"stringValue\": \"" + String(doorIsOpen ? "OPEN" : "CLOSED") + "\"},";
   json += "\"temperature\": {\"doubleValue\": " + String(currentTemp, 1) + "},";
   json += "\"wifiSignal\": {\"integerValue\": " + String(WiFi.RSSI()) + "},";
+  json += "\"wifiSSID\": {\"stringValue\": \"" + WiFi.SSID() + "\"},";
+  json += "\"sensorTempOk\": {\"booleanValue\": " + String(sensorTempOk ? "true" : "false") + "},";
+  json += "\"sensorDoorOk\": {\"booleanValue\": " + String(sensorDoorOk ? "true" : "false") + "},";
+  json += "\"lastOpeningDuration\": {\"integerValue\": " + String(lastOpeningDuration) + "},";
   json += "\"totalOpenings\": {\"integerValue\": " + String(totalOpenings) + "},";
   json += "\"totalOpenSeconds\": {\"integerValue\": " + String(totalOpenSeconds) + "},";
   json += "\"longestOpening\": {\"integerValue\": " + String(longestOpening) + "},";
@@ -605,10 +806,27 @@ void sendToFirestore() {
   // Command field — written by app, cleared by ESP32 after acting on it.
   // We include it in PATCH with its current value so we never accidentally
   // overwrite a pending command that arrived between our polls.
-  // We use updateMask in clearFirestoreCommand() to only touch this field,
-  // so leaving it out of the regular PATCH is safe — Firestore PATCH with
-  // no updateMask only updates fields explicitly listed, not the whole doc.
+  // We use updateMask in clearFirestoreCommand() to only touch this field.
+  // maintenanceCommand is intentionally NOT included here, so a normal
+  // status upload can never overwrite a pending website command.
+
+  // Reliable live/online tracking for the website.
+  // lastSeenEpoch uses real Unix time when NTP is ready. If NTP is not ready,
+  // it is temporarily 0 and the website falls back to snapshot arrival time.
+  time_t epochNow = time(nullptr);
+  unsigned long lastSeenEpoch =
+      (epochNow > 1700000000) ? (unsigned long)epochNow : 0UL;
+
+  json += "\"lastSeenEpoch\": {\"integerValue\": " + String(lastSeenEpoch) + "},";
+  json += "\"uptimeSeconds\": {\"integerValue\": " + String(millis() / 1000) + "},";
   json += "\"lastUpdated\": {\"stringValue\": \"" + String(millis() / 1000) + "s\"},";
+
+  // Real values used by the website instead of placeholder times.
+  json += "\"lastOpenedTime\": {\"stringValue\": \"" + String(lastEvents[0].time) + "\"},";
+  json += "\"lastAlertTime\": {\"stringValue\": \"" + String(lastAlertTime) + "\"},";
+  json += "\"temperatureThreshold\": {\"doubleValue\": " + String(TEMP_THRESHOLD_C, 1) + "},";
+  json += "\"telegramBotUsername\": {\"stringValue\": \"" + telegramBotUsername + "\"},";
+
   json += "\"deviceId\": {\"stringValue\": \"" + deviceId + "\"}";
   json += "}}";
 
@@ -780,7 +998,11 @@ void clearFirestoreCommand() {
   json += "\"maintenanceCommand\": {\"stringValue\": \"\"}";
   json += "}}";
 
-  http.PATCH(json);
+  int httpCode = http.PATCH(json);
+  if (httpCode != 200) {
+    Serial.print("Could not clear maintenanceCommand, code: ");
+    Serial.println(httpCode);
+  }
   http.end();
 }
 
@@ -794,6 +1016,9 @@ void checkFirestoreCommand() {
   int httpCode = http.GET();
 
   if (httpCode != 200) {
+    Serial.print("Firestore command check failed, code: ");
+    Serial.println(httpCode);
+    Serial.println(http.getString());
     http.end();
     return;
   }
@@ -1371,6 +1596,8 @@ void handleDoorChange(bool newDoorState) {
     if (duration > longestOpening) {
       longestOpening = duration;
     }
+
+    lastOpeningDuration = duration; // always overwrite — this event, regardless of longest/today
 
     lastEvents[2] = lastEvents[1];
     lastEvents[1] = lastEvents[0];
@@ -2112,6 +2339,8 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, CHANGE);
   Serial.println("Button ready (short press = next screen, hold 3s = maintenance mode)");
 
+  scanAndPrintNetworks();   // <-- add this line
+
   // WiFi
   connectWiFi();
 
@@ -2124,11 +2353,50 @@ void setup() {
   loadCurrentStatsFromFlash();
   checkDailyDateRollover();
 
+  // Take one immediate temperature reading so the first Firestore upload
+  // already contains real sensor data.
+  sensors.requestTemperatures();
+  float initialTemp = sensors.getTempCByIndex(0);
+
+  if (initialTemp != DEVICE_DISCONNECTED_C) {
+    currentTemp = initialTemp;
+    sensorTempOk = true;
+
+    tempSum += currentTemp;
+    tempSampleCount++;
+    if (currentTemp < tempMinToday) tempMinToday = currentTemp;
+    if (currentTemp > tempMaxToday) tempMaxToday = currentTemp;
+
+    Serial.print("Initial temperature: ");
+    Serial.print(currentTemp, 1);
+    Serial.println(" C");
+  } else {
+    sensorTempOk = false;
+    Serial.println("Initial temperature read failed. Check DS18B20 wiring.");
+  }
+
+  lastTempRead = millis();
+  saveCurrentStatsToFlash();
+
   // Clear old Telegram messages/buttons so old replies do not affect this run.
   if (WiFi.status() == WL_CONNECTED) {
     wifiWasConnected = true;
     clearOldTelegramUpdates();
+
+    // Resolve and publish the bot that belongs to this board's BOT_TOKEN.
+    // Each board therefore opens its own Telegram bot from the website.
+    refreshTelegramBotUsername();
+
     sendTelegramOnlineStatus();
+
+    // Create/update this device's Firestore document immediately.
+    // The website receives its first live snapshot without waiting 12 seconds.
+    sendToFirestore();
+    lastCloudUpload = millis();
+
+    // Receive a maintenance command that may have been saved while offline.
+    checkFirestoreCommand();
+    lastCommandCheck = millis();
   } else {
     wifiWasConnected = false;
     wifiLostAt = millis();
@@ -2171,7 +2439,21 @@ void loop() {
       wifiWasConnected = true;
       wifiLostAt = 0;
 
+      // Refresh the public bot username after reconnecting in case the bot
+      // configuration changed while the board was offline.
+      // REMOVED: refreshTelegramBotUsername() — calling this during reconnect
+      // caused a current spike that immediately dropped WiFi again (thrash loop).
+      // The call in setup() is sufficient; bot username never changes mid-session.
+
       sendTelegramConnectionRestored(offlineMs);
+
+      // Tell the open website immediately that the board is back online.
+      sendToFirestore();
+      lastCloudUpload = millis();
+
+      // A maintenance command may have been written while this board was offline.
+      checkFirestoreCommand();
+      lastCommandCheck = millis();
     }
 
     lastWifiCheck = now;
@@ -2185,6 +2467,7 @@ void loop() {
 
     if (t != DEVICE_DISCONNECTED_C) {
       currentTemp = t;
+      sensorTempOk = true;
 
       // Accumulate for daily average, min, and max
       tempSum += currentTemp;
@@ -2201,6 +2484,7 @@ void loop() {
         lastStatsAutosave = now;
       }
     } else {
+      sensorTempOk = false;
       Serial.println("ERROR: DS18B20 not found. Check wiring/resistor.");
     }
 
